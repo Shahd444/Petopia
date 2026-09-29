@@ -1,0 +1,469 @@
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
+
+import { CreatePetDto, UpdatePetDto } from '@shared/dto/pet.dto';
+import { FindPetsQueryDto } from '@shared/dto/find-pets-query.dto';
+import { normalizePetStatus, PET_STATUS } from '@shared/constants/pet-status.constants';
+import { Pet } from '../../database/entities/pet.entity';
+import { PetImage } from '../../database/entities/pet-image.entity';
+import { MedicalEntry } from '../../database/entities/medical-entry.entity';
+import { MedicalRecord } from '../../database/entities/medical-record.entity';
+import { Vaccination } from '../../database/entities/vaccination.entity';
+import { Adoption } from '../../database/entities/adoption.entity';
+import { FileUpload } from '../../database/entities/file-upload.entity';
+import { FileUploadCategory } from '@shared/enums';
+import { NotificationTypeEnum, RolesEnum } from '@shared/enums';
+import { StoredFileBackup, UploadsService } from '../uploads/uploads.service';
+import { ActivityLog } from '../../database/entities/activity-log.entity';
+import { NotificationsService } from '../notifications/notifications.service';
+
+interface PetImageResponse {
+  imageId: string;
+  fileId: string;
+  imageUrl: string;
+  uploadedAt: Date;
+}
+
+interface PetResponse {
+  petId: string;
+  name: string;
+  species: string;
+  breed?: string | null;
+  age?: number | null;
+  gender?: string | null;
+  color?: string | null;
+  weight?: number | null;
+  description?: string | null;
+  healthStatus?: string | null;
+  adoptionStatus: string;
+  arrivalDate?: string | null;
+  images: PetImageResponse[];
+}
+
+interface PaginatedPetsResponse {
+  data: PetResponse[];
+  total: number;
+  page: number;
+  limit: number;
+}
+
+interface PetFullResponse extends PetResponse {
+  medicalRecord?: {
+    recordId: string;
+    createdAt: Date;
+  };
+  vaccinations: {
+    vaccinationId: string;
+    vaccineName: string;
+    vaccinationDate: string;
+    nextDueDate?: string | null;
+  }[];
+}
+
+@Injectable()
+export class PetsService {
+  constructor(
+    @InjectRepository(Pet)
+    private readonly petRepo: Repository<Pet>,
+
+    @InjectRepository(PetImage)
+    private readonly petImageRepo: Repository<PetImage>,
+
+    @InjectRepository(MedicalRecord)
+    private readonly medicalRecordRepo: Repository<MedicalRecord>,
+
+    @InjectRepository(MedicalEntry)
+    private readonly medicalEntryRepo: Repository<MedicalEntry>,
+
+    @InjectRepository(Vaccination)
+    private readonly vaccinationRepo: Repository<Vaccination>,
+
+    @InjectRepository(Adoption)
+    private readonly adoptionRepo: Repository<Adoption>,
+
+    private readonly dataSource: DataSource,
+
+    private readonly uploadsService: UploadsService,
+
+    @InjectRepository(ActivityLog)
+    private readonly activityLogRepo: Repository<ActivityLog>,
+
+    private readonly notificationsService: NotificationsService,
+  ) {}
+
+  async create(dto: CreatePetDto, createdBy?: string): Promise<PetResponse> {
+    const pet = this.petRepo.create({
+      petName: dto.name,
+      species: dto.species,
+      breed: dto.breed,
+      age: dto.age,
+      gender: dto.gender,
+      color: dto.color,
+      weight: dto.weight === undefined ? undefined : String(dto.weight),
+      description: dto.description,
+      adoptionStatus: PET_STATUS.AVAILABLE,
+      createdBy,
+    });
+
+    const savedPet = await this.petRepo.save(pet);
+
+    await this.activityLogRepo.save(
+      this.activityLogRepo.create({
+        userId: createdBy ?? null,
+        action: 'PET_CREATED',
+        entityType: 'PET',
+        entityId: savedPet.petId,
+      }),
+    );
+
+    const response = await this.findOne(savedPet.petId);
+    await this.notificationsService.notifyRoles(
+      [RolesEnum.ADMIN, RolesEnum.MANAGER, RolesEnum.EMPLOYEE],
+      'Pet created',
+      `${response.name} was added to the shelter.`,
+      NotificationTypeEnum.PET,
+      createdBy ? [createdBy] : [],
+    );
+    return response;
+  }
+
+  async findAll(query: FindPetsQueryDto): Promise<PaginatedPetsResponse> {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 12;
+    const sortBy = query.sortBy ?? 'createdAt';
+    const order = query.order ?? 'DESC';
+    const sortableColumns: Record<NonNullable<FindPetsQueryDto['sortBy']>, string> = {
+      createdAt: 'pet.createdAt',
+      name: 'pet.petName',
+      species: 'pet.species',
+      breed: 'pet.breed',
+      age: 'pet.age',
+      status: 'pet.adoptionStatus',
+    };
+
+    const qb = this.petRepo
+      .createQueryBuilder('pet')
+      .leftJoinAndSelect('pet.images', 'images')
+      .leftJoinAndSelect('images.file', 'imageFile');
+
+    if (query.search) {
+      qb.andWhere(
+        '(pet.petName ILIKE :search OR pet.species ILIKE :search OR pet.breed ILIKE :search)',
+        { search: `%${query.search}%` },
+      );
+    }
+
+    if (query.species) {
+      const species = Array.isArray(query.species) ? query.species : [query.species];
+      qb.andWhere('LOWER(pet.species) IN (:...species)', {
+        species: species.map((value) => value.toLowerCase()),
+      });
+    }
+
+    if (query.breed) {
+      qb.andWhere('pet.breed ILIKE :breed', { breed: query.breed });
+    }
+
+    if (query.status) {
+      const statuses = Array.isArray(query.status) ? query.status : [query.status];
+      qb.andWhere('LOWER(pet.adoptionStatus) IN (:...statuses)', {
+        statuses: statuses.map((value) => value.toLowerCase()),
+      });
+    }
+
+    if (query.health) {
+      qb.andWhere('pet.healthStatus ILIKE :health', { health: query.health });
+    }
+
+    if (query.minAge !== undefined) {
+      qb.andWhere('pet.age >= :minAge', { minAge: query.minAge });
+    }
+
+    if (query.maxAge !== undefined) {
+      qb.andWhere('pet.age <= :maxAge', { maxAge: query.maxAge });
+    }
+
+    qb
+      .orderBy(sortableColumns[sortBy], order)
+      .addOrderBy('pet.petId', 'ASC')
+      .skip((page - 1) * limit)
+      .take(limit);
+
+    const [pets, total] = await qb.getManyAndCount();
+    return {
+      data: pets.map((pet) => this.mapPetResponse(pet)),
+      total,
+      page,
+      limit,
+    };
+  }
+
+  async findOne(id: string): Promise<PetResponse> {
+    const pet = await this.petRepo
+      .createQueryBuilder('pet')
+      .leftJoinAndSelect('pet.images', 'images')
+      .leftJoinAndSelect('images.file', 'imageFile')
+      .where('pet.petId = :id', { id })
+      .getOne();
+
+    if (!pet) {
+      throw new NotFoundException('Pet not found');
+    }
+
+    return this.mapPetResponse(pet);
+  }
+
+  async findFull(id: string): Promise<PetFullResponse> {
+    const pet = await this.petRepo
+      .createQueryBuilder('pet')
+      .leftJoinAndSelect('pet.images', 'images')
+      .leftJoinAndSelect('images.file', 'imageFile')
+      .leftJoinAndSelect('pet.medicalRecord', 'medicalRecord')
+      .leftJoinAndSelect(
+        'pet.vaccinations',
+        'vaccinations',
+        'vaccinations.deletedAt IS NULL',
+      )
+      .where('pet.petId = :id', { id })
+      .getOne();
+
+    if (!pet) {
+      throw new NotFoundException('Pet not found');
+    }
+
+    return this.mapPetFullResponse(pet);
+  }
+
+  async update(id: string, dto: UpdatePetDto): Promise<PetResponse> {
+    await this.dataSource.transaction(async (manager) => {
+      const pet = await manager
+        .getRepository(Pet)
+        .createQueryBuilder('pet')
+        .setLock('pessimistic_write')
+        .where('pet.petId = :id', { id })
+        .getOne();
+
+      if (!pet) {
+        throw new NotFoundException('Pet not found');
+      }
+
+      if (dto.name !== undefined) pet.petName = dto.name;
+      if (dto.species !== undefined) pet.species = dto.species;
+      if (dto.breed !== undefined) pet.breed = dto.breed;
+      if (dto.age !== undefined) pet.age = dto.age;
+      if (dto.gender !== undefined) pet.gender = dto.gender;
+      if (dto.color !== undefined) pet.color = dto.color;
+      if (dto.weight !== undefined) pet.weight = String(dto.weight);
+      if (dto.description !== undefined) pet.description = dto.description;
+      if (dto.adoptionStatus !== undefined) pet.adoptionStatus = dto.adoptionStatus;
+      if (dto.healthStatus !== undefined) pet.healthStatus = dto.healthStatus;
+
+      await manager.getRepository(Pet).save(pet);
+    });
+
+    const response = await this.findOne(id);
+    await this.notificationsService.notifyRoles(
+      [RolesEnum.ADMIN, RolesEnum.MANAGER, RolesEnum.EMPLOYEE],
+      'Pet updated',
+      `${response.name} was updated.`,
+      NotificationTypeEnum.PET,
+    );
+    return response;
+  }
+
+  async uploadPetImage(
+    petId: string,
+    userId: string,
+    file: Express.Multer.File,
+  ): Promise<PetImageResponse> {
+    let uploadedFile: FileUpload | undefined;
+
+    try {
+      await this.getPetEntity(petId);
+
+      uploadedFile = await this.uploadsService.createFileRecord(
+        file,
+        FileUploadCategory.PET_IMAGE,
+        userId,
+      );
+
+      const image = await this.petImageRepo.save(
+        this.petImageRepo.create({
+          petId,
+          fileId: uploadedFile.fileId,
+        }),
+      );
+
+      image.file = uploadedFile;
+      const pet = await this.getPetEntity(petId);
+      await this.notificationsService.notifyRoles(
+        [RolesEnum.ADMIN, RolesEnum.MANAGER, RolesEnum.EMPLOYEE],
+        'Pet image uploaded',
+        `A new image was uploaded for ${pet.petName}.`,
+        NotificationTypeEnum.PET,
+        [userId],
+      );
+      return this.mapPetImageResponse(image);
+    } catch (error) {
+      await this.uploadsService.rollbackFileUpload(
+        file.path,
+        uploadedFile?.fileId,
+      );
+      throw error;
+    }
+  }
+
+  async remove(id: string, actorUserId: string): Promise<{ message: string }> {
+    const removedImageFiles: StoredFileBackup[] = [];
+
+    try {
+      await this.dataSource.transaction(async (manager) => {
+      const petRepo = manager.getRepository(Pet);
+      const pet = await petRepo
+        .createQueryBuilder('pet')
+        .setLock('pessimistic_write')
+        .where('pet.petId = :id', { id })
+        .getOne();
+
+      if (!pet) {
+        throw new NotFoundException('Pet not found');
+      }
+
+      const completedAdoption = await manager
+        .getRepository(Adoption)
+        .createQueryBuilder('adoption')
+        .innerJoin('adoption.request', 'request')
+        .where('request.petId = :petId', { petId: id })
+        .getExists();
+
+      if (completedAdoption) {
+        throw new BadRequestException(
+          'Cannot archive a pet that has completed adoptions',
+        );
+      }
+
+      const medicalRecord = await manager.getRepository(MedicalRecord).findOne({
+        where: { petId: id },
+        select: { recordId: true },
+      });
+
+      if (medicalRecord) {
+        await manager
+          .getRepository(MedicalEntry)
+          .softDelete({ recordId: medicalRecord.recordId });
+      }
+
+      await manager.getRepository(Vaccination).softDelete({ petId: id });
+
+      const petImages = await manager.getRepository(PetImage).find({
+        where: { petId: id },
+        relations: ['file'],
+      });
+
+      for (const image of petImages) {
+        if (!image.file) {
+          throw new NotFoundException('Pet image file not found');
+        }
+        removedImageFiles.push(
+          await this.uploadsService.removePhysicalFile(image.file),
+        );
+      }
+
+      await manager.getRepository(PetImage).delete({ petId: id });
+      for (const image of petImages) {
+        await manager.getRepository(FileUpload).delete(image.fileId);
+      }
+
+      await petRepo.softDelete(id);
+
+      await manager.getRepository(ActivityLog).save(
+        manager.getRepository(ActivityLog).create({
+          userId: actorUserId,
+          action: 'PET_ARCHIVED',
+          entityType: 'PET',
+          entityId: id,
+        }),
+      );
+      });
+    } catch (error) {
+      for (const backup of removedImageFiles.reverse()) {
+        await this.uploadsService.restorePhysicalFile(backup);
+      }
+      throw error;
+    }
+
+    await this.notificationsService.notifyRoles(
+      [RolesEnum.ADMIN, RolesEnum.MANAGER, RolesEnum.EMPLOYEE],
+      'Pet archived',
+      'A pet profile was archived.',
+      NotificationTypeEnum.PET,
+      [actorUserId],
+    );
+
+    return {
+      message: 'Pet archived successfully',
+    };
+  }
+
+  private async getPetEntity(id: string): Promise<Pet> {
+    const pet = await this.petRepo.findOne({
+      where: { petId: id },
+    });
+
+    if (!pet) {
+      throw new NotFoundException('Pet not found');
+    }
+
+    return pet;
+  }
+
+  private mapPetResponse(pet: Pet): PetResponse {
+    return {
+      petId: pet.petId,
+      name: pet.petName,
+      species: pet.species,
+      breed: pet.breed,
+      age: pet.age,
+      gender: pet.gender,
+      color: pet.color,
+      weight: this.mapWeight(pet.weight),
+      description: pet.description,
+      healthStatus: pet.healthStatus,
+      adoptionStatus: String(normalizePetStatus(pet.adoptionStatus)),
+      arrivalDate: pet.arrivalDate,
+      images: (pet.images ?? []).map((image) => this.mapPetImageResponse(image)),
+    };
+  }
+
+  private mapPetFullResponse(pet: Pet): PetFullResponse {
+    return {
+      ...this.mapPetResponse(pet),
+      medicalRecord: pet.medicalRecord
+        ? {
+            recordId: pet.medicalRecord.recordId,
+            createdAt: pet.medicalRecord.createdAt,
+          }
+        : undefined,
+      vaccinations: (pet.vaccinations ?? []).map((vaccination) => ({
+        vaccinationId: vaccination.vaccinationId,
+        vaccineName: vaccination.vaccineName,
+        vaccinationDate: vaccination.vaccinationDate,
+        nextDueDate: vaccination.nextDueDate,
+      })),
+    };
+  }
+
+  private mapPetImageResponse(image: PetImage): PetImageResponse {
+    return {
+      imageId: image.imageId,
+      fileId: image.fileId,
+      imageUrl: this.uploadsService.getFileReference(image.file),
+      uploadedAt: image.uploadedAt,
+    };
+  }
+
+  private mapWeight(weight?: string | null): number | null {
+    return weight === undefined || weight === null ? null : Number(weight);
+  }
+}

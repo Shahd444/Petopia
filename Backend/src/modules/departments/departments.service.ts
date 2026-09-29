@@ -1,0 +1,333 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, QueryFailedError, Repository } from 'typeorm';
+import { NotificationTypeEnum, RolesEnum } from '@shared/enums';
+
+import { Department } from '../../database/entities/department.entity';
+import { Employee } from '../../database/entities/employee.entity';
+import {
+  AssignDepartmentUsersDto,
+  CreateDepartmentDto,
+  UpdateDepartmentDto,
+} from '@shared/dto/department.dto';
+import { NotificationsService } from '../notifications/notifications.service';
+
+@Injectable()
+export class DepartmentsService {
+  constructor(
+    @InjectRepository(Department)
+    private readonly departmentRepo: Repository<Department>,
+    @InjectRepository(Employee)
+    private readonly employeeRepo: Repository<Employee>,
+    private readonly dataSource: DataSource,
+    private readonly notificationsService: NotificationsService,
+  ) {}
+
+  async findAll(activeOnly = false) {
+    const departments = await this.departmentRepo.find({
+      where: activeOnly ? { isActive: true } : {},
+      relations: ['manager', 'employees', 'employees.user', 'employees.user.role'],
+      order: { departmentName: 'ASC' },
+    });
+    const systemEmployees = await this.findActiveSystemEmployees();
+    return departments.map((department) => this.serialize(department, systemEmployees));
+  }
+
+  async findOne(departmentId: string) {
+    const department = await this.departmentRepo.findOne({
+      where: { departmentId },
+      relations: ['manager', 'employees', 'employees.user', 'employees.user.role'],
+    });
+
+    if (!department) {
+      throw new NotFoundException('Department not found');
+    }
+
+    //removes the password field from the user object before returning it
+    const systemEmployees = await this.findActiveSystemEmployees();
+    return this.serialize(department, systemEmployees);
+  }
+
+  async create(dto: CreateDepartmentDto) {
+    //remove leading and trailing whitespace from the department name
+    const departmentName = this.normalizeName(dto.departmentName);
+    this.ensureNameIsNotBlank(departmentName);
+    const existingDepartment = await this.departmentRepo
+      .createQueryBuilder('department')
+      //remove leading and trailing whitespace from the department name and convert to lowercase before comparing
+      .where('LOWER(BTRIM(department.department_name)) = LOWER(BTRIM(:departmentName))', {
+        departmentName,
+      })
+      .getOne();
+
+    if (existingDepartment) {
+      throw new ConflictException('Department name already exists');
+    }
+
+    const department = this.departmentRepo.create({
+      ...dto,
+      departmentName,
+    });
+    const saved = await this.saveDepartment(department);
+    await this.notifyStaff('Department created', `${saved.departmentName} department was created.`);
+    return this.serialize(saved);
+  }
+
+  async update(departmentId: string, dto: UpdateDepartmentDto) {
+    const department = await this.departmentRepo.findOne({
+      where: { departmentId },
+    });
+
+    if (!department) {
+      throw new NotFoundException('Department not found');
+    }
+
+    const departmentName = dto.departmentName === undefined
+      ? undefined
+      : this.normalizeName(dto.departmentName);
+
+    if (departmentName !== undefined) {
+      this.ensureNameIsNotBlank(departmentName);
+    }
+
+    if (
+      departmentName !== undefined &&
+      //remove leading and trailing whitespace from the department name before comparing
+      this.normalizeName(departmentName) !==
+        this.normalizeName(department.departmentName)
+    ) {
+      const existingDepartment = await this.departmentRepo
+        .createQueryBuilder('department')
+        .where('LOWER(BTRIM(department.department_name)) = LOWER(BTRIM(:departmentName))', {
+          departmentName,
+        })
+        // nor equal <> ignore the current department being updated and check for other departments with the same name
+        .andWhere('department.department_id <> :departmentId', {
+          departmentId,
+        })
+        .getOne();
+
+      if (existingDepartment) {
+        throw new ConflictException('Department name already exists');
+      }
+    }
+
+    Object.assign(department, {
+      ...dto,
+      ...(departmentName === undefined ? {} : { departmentName }),
+    });
+    const saved = await this.saveDepartment(department);
+    await this.notifyStaff('Department updated', `${saved.departmentName} department was updated.`);
+    return this.serialize(saved);
+  }
+
+  async remove(departmentId: string) {
+    let departmentName = 'A department';
+    await this.dataSource.transaction(async (manager) => {
+      const department = await manager
+        .getRepository(Department)
+        .createQueryBuilder('department')
+        .setLock('pessimistic_write')
+        .where('department.department_id = :departmentId', { departmentId })
+        .getOne();
+
+      if (!department) {
+        throw new NotFoundException('Department not found');
+      }
+
+      if (!department.isActive) {
+        return;
+      }
+      departmentName = department.departmentName;
+
+      const employeeCount = await this.countActiveDepartmentEmployees(
+        department.departmentName,
+        departmentId,
+        manager,
+      );
+
+      if (employeeCount > 0) {
+        throw new BadRequestException(
+          'Move or remove department users before deleting the department',
+        );
+      }
+
+      department.isActive = false;
+      await manager.save(department);
+    });
+    await this.notifyStaff('Department deleted', `${departmentName} was deleted.`);
+
+    return { message: 'Department deleted successfully' };
+  }
+
+  async assignUsers(departmentId: string, dto: AssignDepartmentUsersDto) {
+    const uniqueUserIds = [...new Set(dto.userIds)];
+    return this.dataSource.transaction(async (manager) => {
+      const department = await manager
+        .getRepository(Department)
+        .createQueryBuilder('department')
+        .setLock('pessimistic_write')
+        .where('department.department_id = :departmentId', { departmentId })
+        .getOne();
+
+      if (!department || !department.isActive) {
+        throw new NotFoundException('Active department not found');
+      }
+
+      const employees = await manager.find(Employee, {
+        where: uniqueUserIds.map((userId) => ({ userId })),
+        relations: ['user', 'user.role'],
+      });
+
+      if (employees.length !== uniqueUserIds.length) {
+        const foundUserIds = new Set(employees.map((employee) => employee.userId));
+        const missingUserIds = uniqueUserIds.filter(
+          (userId) => !foundUserIds.has(userId),
+        );
+        throw new BadRequestException(
+          `Users do not have employee profiles: ${missingUserIds.join(', ')}`,
+        );
+      }
+
+      const inactiveEmployees = employees.filter(
+        (employee) => employee.user.status !== 'active',
+      );
+      if (inactiveEmployees.length > 0) {
+        throw new BadRequestException('Inactive users cannot be assigned to a department');
+      }
+
+      await manager
+        .createQueryBuilder()
+        .update(Employee)
+        .set({ departmentId })
+        .where('user_id IN (:...userIds)', { userIds: uniqueUserIds })
+        .execute();
+
+      const updatedDepartment = await manager.findOne(Department, {
+        where: { departmentId },
+        relations: ['manager', 'employees', 'employees.user', 'employees.user.role'],
+      });
+
+      if (updatedDepartment) {
+        await this.notifyStaff('Department users assigned', `${updatedDepartment.departmentName} assignments were updated.`);
+      }
+      return updatedDepartment ? this.serialize(updatedDepartment) : null;
+    });
+  }
+
+  private notifyStaff(title: string, message: string) {
+    return this.notificationsService.notifyRoles(
+      [RolesEnum.ADMIN, RolesEnum.MANAGER, RolesEnum.EMPLOYEE],
+      title,
+      message,
+      NotificationTypeEnum.DEPARTMENT,
+    );
+  }
+
+  //removes leading and trailing whitespace from the department name
+  private normalizeName(name: string) {
+    return name.trim();
+  }
+
+  private ensureNameIsNotBlank(name: string) {
+    if (!name) {
+      throw new BadRequestException('Department name cannot be blank');
+    }
+  }
+
+  private async saveDepartment(department: Department) {
+    try {
+      return await this.departmentRepo.save(department);
+    } catch (error) {
+      if (error instanceof QueryFailedError && (error as any).code === '23505') {
+        throw new ConflictException('Department name already exists');
+      }
+      throw error;
+    }
+  }
+
+  //removes the password field from the user object before returning it
+  private serialize(department: Department, systemEmployees: Employee[] = []) {
+    const departmentRole = this.departmentRoleName(department.departmentName);
+    const activeEmployees = departmentRole
+      ? systemEmployees.filter((employee) =>
+          employee.user?.role?.roleName?.toUpperCase() === departmentRole,
+        )
+      : department.employees?.filter((employee) =>
+          employee.status === 'active' &&
+          employee.user?.status === 'active' &&
+          employee.user?.emailVerified === true,
+        );
+
+    return {
+      ...department,
+      manager: department.manager
+        ? this.withoutPassword(department.manager)
+        : department.manager,
+      employeeCount: activeEmployees?.length ?? 0,
+      employees: activeEmployees?.map((employee) => ({
+        ...employee,
+        user: employee.user ? this.withoutPassword(employee.user) : employee.user,
+      })),
+    };
+  }
+
+  private findActiveSystemEmployees() {
+    return this.employeeRepo
+      .createQueryBuilder('employee')
+      .innerJoinAndSelect('employee.user', 'user')
+      .innerJoinAndSelect('user.role', 'role')
+      .where('employee.status = :employeeStatus', { employeeStatus: 'active' })
+      .andWhere('user.status = :userStatus', { userStatus: 'active' })
+      .andWhere('user.email_verified = true')
+      .getMany();
+  }
+
+  private async countActiveDepartmentEmployees(
+    departmentName: string,
+    departmentId: string,
+    manager = this.dataSource.manager,
+  ) {
+    const departmentRole = this.departmentRoleName(departmentName);
+    const query = manager
+      .getRepository(Employee)
+      .createQueryBuilder('employee')
+      .innerJoin('employee.user', 'user')
+      .innerJoin('user.role', 'role')
+      .where('employee.status = :employeeStatus', { employeeStatus: 'active' })
+      .andWhere('user.status = :userStatus', { userStatus: 'active' })
+      .andWhere('user.email_verified = true');
+
+    if (departmentRole) {
+      query.andWhere('UPPER(role.role_name) = :departmentRole', { departmentRole });
+    } else {
+      query.andWhere('employee.department_id = :departmentId', { departmentId });
+    }
+
+    return query.getCount();
+  }
+
+  private departmentRoleName(departmentName: string) {
+    switch (departmentName.trim().toLowerCase()) {
+      case 'customer service':
+        return 'EMPLOYEE';
+      case 'management':
+        return 'MANAGER';
+      case 'veterinary':
+        return 'VET';
+      default:
+        return null;
+    }
+  }
+
+  private withoutPassword<T extends { password: string | null }>(user: T) {
+    const { password: _password, ...safeUser } = user;
+    return safeUser;
+  }
+
+}

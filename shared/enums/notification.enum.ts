@@ -1,0 +1,23 @@
+export enum NotificationTypeEnum {
+  MESSAGE = "MESSAGE",
+
+  ADOPTION = "ADOPTION",
+
+  INVENTORY = "INVENTORY",
+
+  PET = "PET",
+
+  MEDICAL = "MEDICAL",
+
+  USER = "USER",
+
+  DEPARTMENT = "DEPARTMENT",
+
+  ORDER = "ORDER",
+
+  COMMUNITY = "COMMUNITY",
+
+  FRIEND = "FRIEND",
+
+  SYSTEM = "SYSTEM",
+}
